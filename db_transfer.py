@@ -8,6 +8,7 @@ import sys
 from server_pool import ServerPool
 import Config
 import traceback
+from shadowsocks import common
 
 class DbTransfer(object):
 
@@ -115,8 +116,13 @@ class DbTransfer(object):
 				allow = False
 
 			port = row['port']
-			passwd = row['passwd']
-			cur_servers[port] = passwd
+			passwd = common.to_bytes(row['passwd'])
+
+			if port not in cur_servers:
+				cur_servers[port] = passwd
+			else:
+				logging.error('more than one user use the same port [%s]' % (port,))
+				continue
 
 			if ServerPool.get_instance().server_is_run(port) > 0:
 				if not allow:
