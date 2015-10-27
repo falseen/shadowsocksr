@@ -54,6 +54,16 @@ def to_str(s):
             return s.decode('utf-8')
     return s
 
+def int32(x):
+    if x > 0xFFFFFFFF or x < 0:
+        x &= 0xFFFFFFFF
+    if x > 0x7FFFFFFF:
+        x = int(0x100000000 - x)
+        if x < 0x80000000:
+            return -x
+        else:
+            return -2147483648
+    return x
 
 def inet_ntop(family, ipstr):
     if family == socket.AF_INET:
@@ -160,7 +170,7 @@ def pre_parse_header(data):
                          'encryption method')
             return None
         data = data[rand_data_size + 3:]
-    elif datatype == 0x88:
+    elif datatype == 0x88 or (~datatype & 0xff) == 0x88:
         if len(data) <= 7 + 7:
             return None
         data_size = struct.unpack('>H', data[1:3])[0]

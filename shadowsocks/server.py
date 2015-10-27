@@ -23,7 +23,12 @@ import os
 import logging
 import signal
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../'))
+if __name__ == '__main__':
+    import inspect
+    file_path = os.path.dirname(os.path.realpath(inspect.getfile(inspect.currentframe())))
+    os.chdir(file_path)
+    sys.path.insert(0, os.path.join(file_path, '../'))
+
 from shadowsocks import shell, daemon, eventloop, tcprelay, udprelay, \
     asyncdns, manager
 
@@ -59,22 +64,30 @@ def main():
     dns_resolver = asyncdns.DNSResolver()
     port_password = config['port_password']
     del config['port_password']
-    for port, password in port_password.items():
+    for port, password_obfs in port_password.items():
+        if type(password_obfs) == list:
+            password = password_obfs[0]
+            obfs = password_obfs[1]
+        else:
+            password = password_obfs
+            obfs = config["obfs"]
         a_config = config.copy()
         ipv6_ok = False
-        logging.info("server start with password [%s] method [%s]" % (password, a_config['method']))
+        logging.info("server start with password [%s] method [%s] obfs [%s] obfs_param [%s]" %
+                (password, a_config['method'], obfs, a_config['obfs_param']))
         if 'server_ipv6' in a_config:
             try:
                 if len(a_config['server_ipv6']) > 2 and a_config['server_ipv6'][0] == "[" and a_config['server_ipv6'][-1] == "]":
                     a_config['server_ipv6'] = a_config['server_ipv6'][1:-1]
                 a_config['server_port'] = int(port)
                 a_config['password'] = password
+                a_config['obfs'] = obfs
                 a_config['server'] = a_config['server_ipv6']
-                logging.info("starting server at %s:%d" %
+                logging.info("starting server at [%s]:%d" %
                              (a_config['server'], int(port)))
                 tcp_servers.append(tcprelay.TCPRelay(a_config, dns_resolver, False))
                 udp_servers.append(udprelay.UDPRelay(a_config, dns_resolver, False))
-                if a_config['server_ipv6'] == "::":
+                if a_config['server_ipv6'] == b"::":
                     ipv6_ok = True
             except Exception as e:
                 shell.print_exception(e)
@@ -83,6 +96,7 @@ def main():
             a_config = config.copy()
             a_config['server_port'] = int(port)
             a_config['password'] = password
+            a_config['obfs'] = obfs
             logging.info("starting server at %s:%d" %
                          (a_config['server'], int(port)))
             tcp_servers.append(tcprelay.TCPRelay(a_config, dns_resolver, False))

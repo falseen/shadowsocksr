@@ -29,7 +29,7 @@ from shadowsocks import common, eventloop, tcprelay, udprelay, asyncdns, shell
 
 
 BUF_SIZE = 1506
-STAT_SEND_LIMIT = 100
+STAT_SEND_LIMIT = 50
 
 
 class Manager(object):
@@ -44,7 +44,7 @@ class Manager(object):
         self._statistics = collections.defaultdict(int)
         self._control_client_addr = None
         try:
-            manager_address = config['manager_address']
+            manager_address = common.to_str(config['manager_address'])
             if ':' in manager_address:
                 addr = manager_address.rsplit(':', 1)
                 addr = addr[0], int(addr[1])
@@ -167,7 +167,9 @@ class Manager(object):
             if i >= STAT_SEND_LIMIT:
                 send_data(r)
                 r.clear()
-        send_data(r)
+                i = 0
+        if len(r) > 0 :
+            send_data(r)
         self._statistics.clear()
 
     def _send_control_data(self, data):
