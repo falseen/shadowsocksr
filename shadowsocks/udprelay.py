@@ -70,8 +70,9 @@ import errno
 import random
 import binascii
 import traceback
+import threading
 
-from shadowsocks import encrypt, eventloop, lru_cache, common, shell
+from shadowsocks import encrypt, obfs, eventloop, lru_cache, common, shell
 from shadowsocks.common import pre_parse_header, parse_header, pack_addr
 
 # we clear at most TIMEOUTS_CLEAN_SIZE timeouts each time
@@ -301,6 +302,10 @@ class TCPRelayHandler(object):
             self._forbidden_iplist = config['forbidden_ip']
         else:
             self._forbidden_iplist = None
+        if 'forbidden_port' in config:
+            self._forbidden_portset = config['forbidden_port']
+        else:
+            self._forbidden_portset = None
         #fd_to_handlers[local_sock.fileno()] = self
         #local_sock.setblocking(False)
         #loop.add(local_sock, eventloop.POLL_IN | eventloop.POLL_ERR)
@@ -528,8 +533,8 @@ class TCPRelayHandler(object):
         if not data:
             self.destroy()
             return
-        self._server.server_transfer_dl += len(data)
         try:
+            self._server.server_transfer_dl += len(data)
             recv_data = data
             beg_pos = 0
             max_len = len(recv_data)
@@ -693,7 +698,7 @@ class TCPRelayHandler(object):
                     self._stage = STAGE_DNS
                     self._dns_resolver.resolve(remote_addr,
                                                self._handle_dns_resolved)
-                    logging.info('TCP connect %s:%d from %s:%d' % (remote_addr, remote_port, addr[0], addr[1]))
+                    common.connect_log('TCPonUDP connect %s:%d from %s:%d' % (remote_addr, remote_port, addr[0], addr[1]))
                 else:
                     # ileagal request
                     rsp_data = self._pack_rsp_data(CMD_DISCONNECT, RSP_STATE_EMPTY)
@@ -777,34 +782,43 @@ class TCPRelayHandler(object):
 
     def handle_event(self, sock, event):
         # handle all events in this handler and dispatch them to methods
+        handle = False
         if self._stage == STAGE_DESTROYED:
             logging.debug('ignore handle_event: destroyed')
-            return
+            return True
         # order is important
         if sock == self._remote_sock:
             if event & eventloop.POLL_ERR:
+                handle = True
                 self._on_remote_error()
                 if self._stage == STAGE_DESTROYED:
-                    return
+                    return True
             if event & (eventloop.POLL_IN | eventloop.POLL_HUP):
+                handle = True
                 self._on_remote_read()
                 if self._stage == STAGE_DESTROYED:
-                    return
+                    return True
             if event & eventloop.POLL_OUT:
+                handle = True
                 self._on_remote_write()
         elif sock == self._local_sock:
             if event & eventloop.POLL_ERR:
+                handle = True
                 self._on_local_error()
                 if self._stage == STAGE_DESTROYED:
-                    return
+                    return True
             if event & (eventloop.POLL_IN | eventloop.POLL_HUP):
+                handle = True
                 self._on_local_read()
                 if self._stage == STAGE_DESTROYED:
-                    return
+                    return True
             if event & eventloop.POLL_OUT:
+                handle = True
                 self._on_local_write()
         else:
             logging.warn('unknown socket')
+
+        return handle
 
     def _log_error(self, e):
         logging.error('%s when handling connection from %s' %
@@ -863,8 +877,10 @@ def client_key(source_addr, server_af):
 
 
 class UDPRelay(object):
-    def __init__(self, config, dns_resolver, is_local, stat_callback=None):
+    def __init__(self, config, dns_resolver, is_local, stat_callback=None, stat_counter=None):
         self._config = config
+        if config.get('connect_verbose_info', 0) > 0:
+            common.connect_log = logging.info
         if is_local:
             self._listen_addr = config['local_address']
             self._listen_port = config['local_port']
@@ -880,30 +896,60 @@ class UDPRelay(object):
         self._method = config['method']
         self._timeout = config['timeout']
         self._is_local = is_local
-        self._cache = lru_cache.LRUCache(timeout=config['timeout'],
-                                         close_callback=self._close_client)
-        self._client_fd_to_server_addr = \
-            lru_cache.LRUCache(timeout=config['timeout'])
-        self._dns_cache = lru_cache.LRUCache(timeout=300)
+        self._udp_cache_size = config['udp_cache']
+        self._cache = lru_cache.LRUCache(timeout=config['udp_timeout'],
+                                         close_callback=self._close_client_pair)
+        self._cache_dns_client = lru_cache.LRUCache(timeout=10,
+                                         close_callback=self._close_client_pair)
+        self._client_fd_to_server_addr = {}
+        self._dns_cache = lru_cache.LRUCache(timeout=1800)
         self._eventloop = None
         self._closed = False
         self.server_transfer_ul = 0
         self.server_transfer_dl = 0
+        self.server_users = {}
+        self.server_user_transfer_ul = {}
+        self.server_user_transfer_dl = {}
+
+        if common.to_bytes(config['protocol']) in [b"auth_aes128_md5", b"auth_aes128_sha1"]:
+            self._update_users(None, None)
+
+        self.protocol_data = obfs.obfs(config['protocol']).init_data()
+        self._protocol = obfs.obfs(config['protocol'])
+        server_info = obfs.server_info(self.protocol_data)
+        server_info.host = self._listen_addr
+        server_info.port = self._listen_port
+        server_info.users = self.server_users
+        server_info.protocol_param = config['protocol_param']
+        server_info.obfs_param = ''
+        server_info.iv = b''
+        server_info.recv_iv = b''
+        server_info.key_str = common.to_bytes(config['password'])
+        server_info.key = encrypt.encrypt_key(self._password, self._method)
+        server_info.head_len = 30
+        server_info.tcp_mss = 1440
+        self._protocol.set_server_info(server_info)
 
         self._sockets = set()
         self._fd_to_handlers = {}
         self._reqid_to_hd = {}
         self._data_to_write_to_server_socket = []
 
-        self._timeouts = []  # a list for all the handlers
-        # we trim the timeouts once a while
-        self._timeout_offset = 0   # last checked position for timeout
-        self._handler_to_timeouts = {}  # key: handler value: index in timeouts
+        self._timeout_cache = lru_cache.LRUCache(timeout=self._timeout,
+                                         close_callback=self._close_tcp_client)
+
+        self._bind = config.get('out_bind', '')
+        self._bindv6 = config.get('out_bindv6', '')
+        self._ignore_bind_list = config.get('ignore_bind', [])
 
         if 'forbidden_ip' in config:
             self._forbidden_iplist = config['forbidden_ip']
         else:
             self._forbidden_iplist = None
+        if 'forbidden_port' in config:
+            self._forbidden_portset = config['forbidden_port']
+        else:
+            self._forbidden_portset = None
 
         addrs = socket.getaddrinfo(self._listen_addr, self._listen_port, 0,
                                    socket.SOCK_DGRAM, socket.SOL_UDP)
@@ -914,8 +960,6 @@ class UDPRelay(object):
         server_socket = socket.socket(af, socktype, proto)
         server_socket.bind((self._listen_addr, self._listen_port))
         server_socket.setblocking(False)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 32)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 32)
         self._server_socket = server_socket
         self._stat_callback = stat_callback
 
@@ -929,13 +973,88 @@ class UDPRelay(object):
         logging.debug('chosen server: %s:%d', server, server_port)
         return server, server_port
 
+    def get_ud(self):
+        return (self.server_transfer_ul, self.server_transfer_dl)
+
+    def get_users_ud(self):
+        ret = (self.server_user_transfer_ul.copy(), self.server_user_transfer_dl.copy())
+        return ret
+
+    def _update_users(self, protocol_param, acl):
+        if protocol_param is None:
+            protocol_param = self._config['protocol_param']
+        param = common.to_bytes(protocol_param).split(b'#')
+        if len(param) == 2:
+            user_list = param[1].split(b',')
+            if user_list:
+                for user in user_list:
+                    items = user.split(b':')
+                    if len(items) == 2:
+                        user_int_id = int(items[0])
+                        uid = struct.pack('<I', user_int_id)
+                        if acl is not None and user_int_id not in acl:
+                            self.del_user(uid)
+                        else:
+                            passwd = items[1]
+                            self.add_user(uid, passwd)
+
+    def update_user(self, id, passwd):
+        uid = struct.pack('<I', id)
+        self.add_user(uid, passwd)
+
+    def update_users(self, users):
+        for uid in list(self.server_users.keys()):
+            id = struct.unpack('<I', uid)[0]
+            if id not in users:
+                self.del_user(uid)
+        for id in users:
+            uid = struct.pack('<I', id)
+            self.add_user(uid, users[id])
+
+    def add_user(self, user, passwd): # user: binstr[4], passwd: str
+        self.server_users[user] = common.to_bytes(passwd)
+
+    def del_user(self, user):
+        if user in self.server_users:
+            del self.server_users[user]
+
+    def add_transfer_u(self, user, transfer):
+        if user is None:
+            self.server_transfer_ul += transfer
+        else:
+            if user not in self.server_user_transfer_ul:
+                self.server_user_transfer_ul[user] = 0
+            self.server_user_transfer_ul[user] += transfer + self.server_transfer_ul
+            self.server_transfer_ul = 0
+
+    def add_transfer_d(self, user, transfer):
+        if user is None:
+            self.server_transfer_dl += transfer
+        else:
+            if user not in self.server_user_transfer_dl:
+                self.server_user_transfer_dl[user] = 0
+            self.server_user_transfer_dl[user] += transfer + self.server_transfer_dl
+            self.server_transfer_dl = 0
+
+    def _close_client_pair(self, client_pair):
+        client, uid = client_pair
+        self._close_client(client)
+
     def _close_client(self, client):
         if hasattr(client, 'close'):
+            if not self._is_local:
+                if client.fileno() in self._client_fd_to_server_addr:
+                    logging.debug('close_client: %s' %
+                                 (self._client_fd_to_server_addr[client.fileno()],))
+                else:
+                    client.info('close_client')
             self._sockets.remove(client.fileno())
             self._eventloop.remove(client)
+            del self._client_fd_to_server_addr[client.fileno()]
             client.close()
         else:
             # just an address
+            client.info('close_client pass %s' % client)
             pass
 
     def _pre_parse_udp_header(self, data):
@@ -977,6 +1096,25 @@ class UDPRelay(object):
         #raise Exception('can not parse header')
         logging.warn("Protocol ERROR, UDP ogn data %s from %s:%d" % (binascii.hexlify(ogn_data), client_address[0], client_address[1]))
 
+    def _socket_bind_addr(self, sock, af):
+        bind_addr = ''
+        if self._bind and af == socket.AF_INET:
+            bind_addr = self._bind
+        elif self._bindv6 and af == socket.AF_INET6:
+            bind_addr = self._bindv6
+
+        bind_addr = bind_addr.replace("::ffff:", "")
+        if bind_addr in self._ignore_bind_list:
+            bind_addr = None
+        if bind_addr:
+            local_addrs = socket.getaddrinfo(bind_addr, 0, 0, socket.SOCK_DGRAM, socket.SOL_UDP)
+            if local_addrs[0][0] == af:
+                logging.debug("bind %s" % (bind_addr,))
+                try:
+                    sock.bind((bind_addr, 0))
+                except Exception as e:
+                    logging.warn("bind %s fail" % (bind_addr,))
+
     def _handle_server(self):
         server = self._server_socket
         data, r_addr = server.recvfrom(BUF_SIZE)
@@ -985,6 +1123,7 @@ class UDPRelay(object):
             logging.debug('UDP handle_server: data is empty')
         if self._stat_callback:
             self._stat_callback(self._listen_port, len(data))
+        uid = None
         if self._is_local:
             frag = common.ord(data[2])
             if frag != 0:
@@ -993,11 +1132,14 @@ class UDPRelay(object):
             else:
                 data = data[3:]
         else:
-            data = encrypt.encrypt_all(self._password, self._method, 0, data)
+            ref_iv = [0]
+            data = encrypt.encrypt_all_iv(self._protocol.obfs.server_info.key, self._method, 0, data, ref_iv)
             # decrypt data
             if not data:
                 logging.debug('UDP handle_server: data is empty after decrypt')
                 return
+            self._protocol.obfs.server_info.recv_iv = ref_iv[0]
+            data, uid = self._protocol.server_udp_post_decrypt(data)
 
         #logging.info("UDP data %s" % (binascii.hexlify(data),))
         if not self._is_local:
@@ -1008,68 +1150,8 @@ class UDPRelay(object):
                 return
 
             if type(data) is tuple:
-                #(cmd, request_id, data)
-                #logging.info("UDP data %d %d %s" % (data[0], data[1], binascii.hexlify(data[2])))
-                try:
-                    if data[0] == 0:
-                        if len(data[2]) >= 4:
-                            for i in range(64):
-                                req_id = random.randint(1, 65535)
-                                if req_id not in self._reqid_to_hd:
-                                    break
-                            if req_id in self._reqid_to_hd:
-                                for i in range(64):
-                                    req_id = random.randint(1, 65535)
-                                    if type(self._reqid_to_hd[req_id]) is tuple:
-                                        break
-                            # return req id
-                            self._reqid_to_hd[req_id] = (data[2][0:4], None)
-                            rsp_data = self._pack_rsp_data(CMD_RSP_CONNECT, req_id, RSP_STATE_CONNECTED)
-                            data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
-                            self.write_to_server_socket(data_to_send, r_addr)
-                    elif data[0] == CMD_CONNECT_REMOTE:
-                        if len(data[2]) > 4 and data[1] in self._reqid_to_hd:
-                            # create
-                            if type(self._reqid_to_hd[data[1]]) is tuple:
-                                if data[2][0:4] == self._reqid_to_hd[data[1]][0]:
-                                    handle = TCPRelayHandler(self, self._reqid_to_hd, self._fd_to_handlers,
-                                        self._eventloop, self._server_socket,
-                                        self._reqid_to_hd[data[1]][0], self._reqid_to_hd[data[1]][1],
-                                        self._config, self._dns_resolver, self._is_local)
-                                    self._reqid_to_hd[data[1]] = handle
-                                    handle.handle_client(r_addr, CMD_CONNECT, data[1], data[2])
-                                    handle.handle_client(r_addr, *data)
-                                    self.update_activity(handle)
-                                else:
-                                    # disconnect
-                                    rsp_data = self._pack_rsp_data(CMD_DISCONNECT, data[1], RSP_STATE_EMPTY)
-                                    data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
-                                    self.write_to_server_socket(data_to_send, r_addr)
-                            else:
-                                self.update_activity(self._reqid_to_hd[data[1]])
-                                self._reqid_to_hd[data[1]].handle_client(r_addr, *data)
-                        else:
-                            # disconnect
-                            rsp_data = self._pack_rsp_data(CMD_DISCONNECT, data[1], RSP_STATE_EMPTY)
-                            data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
-                            self.write_to_server_socket(data_to_send, r_addr)
-                    elif data[0] > CMD_CONNECT_REMOTE and data[0] <= CMD_DISCONNECT:
-                        if data[1] in self._reqid_to_hd:
-                            if type(self._reqid_to_hd[data[1]]) is tuple:
-                                pass
-                            else:
-                                self.update_activity(self._reqid_to_hd[data[1]])
-                                self._reqid_to_hd[data[1]].handle_client(r_addr, *data)
-                        else:
-                            # disconnect
-                            rsp_data = self._pack_rsp_data(CMD_DISCONNECT, data[1], RSP_STATE_EMPTY)
-                            data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
-                            self.write_to_server_socket(data_to_send, r_addr)
-                    return
-                except Exception as e:
-                    trace = traceback.format_exc()
-                    logging.error(trace)
-                    return
+                return
+                #return self._handle_tcp_over_udp(data, r_addr)
 
         try:
             header_result = parse_header(data)
@@ -1083,47 +1165,83 @@ class UDPRelay(object):
         connecttype, dest_addr, dest_port, header_length = header_result
 
         if self._is_local:
+            connecttype = 3
             server_addr, server_port = self._get_a_server()
         else:
             server_addr, server_port = dest_addr, dest_port
 
-        addrs = self._dns_cache.get(server_addr, None)
-        if addrs is None:
+        if (connecttype & 7) == 3:
+            addrs = self._dns_cache.get(server_addr, None)
+            if addrs is None:
+                # TODO async getaddrinfo
+                addrs = socket.getaddrinfo(server_addr, server_port, 0,
+                                           socket.SOCK_DGRAM, socket.SOL_UDP)
+                if not addrs:
+                    # drop
+                    return
+                else:
+                    self._dns_cache[server_addr] = addrs
+        else:
             addrs = socket.getaddrinfo(server_addr, server_port, 0,
                                        socket.SOCK_DGRAM, socket.SOL_UDP)
             if not addrs:
                 # drop
                 return
-            else:
-                self._dns_cache[server_addr] = addrs
 
         af, socktype, proto, canonname, sa = addrs[0]
         key = client_key(r_addr, af)
-        client = self._cache.get(key, None)
-        if not client:
-            # TODO async getaddrinfo
+        client_pair = self._cache.get(key, None)
+        if not client_pair:
+            client_pair = self._cache_dns_client.get(key, None)
+        if not client_pair:
             if self._forbidden_iplist:
                 if common.to_str(sa[0]) in self._forbidden_iplist:
                     logging.debug('IP %s is in forbidden list, drop' %
                                   common.to_str(sa[0]))
                     # drop
                     return
+            if self._forbidden_portset:
+                if sa[1] in self._forbidden_portset:
+                    logging.debug('Port %d is in forbidden list, reject' %
+                                    sa[1])
+                    # drop
+                    return
             client = socket.socket(af, socktype, proto)
+            client_uid = uid
             client.setblocking(False)
-            self._cache[key] = client
-            self._client_fd_to_server_addr[client.fileno()] = r_addr
+            self._socket_bind_addr(client, af)
+            is_dns = False
+            if len(data) > 20 and data[11:19] == b"\x00\x01\x00\x00\x00\x00\x00\x00":
+                is_dns = True
+            else:
+                pass
+                #logging.info("unknown data %s" % (binascii.hexlify(data),))
+            if sa[1] == 53 and is_dns: #DNS
+                logging.debug("DNS query %s from %s:%d" % (common.to_str(sa[0]), r_addr[0], r_addr[1]))
+                self._cache_dns_client[key] = (client, uid)
+            else:
+                self._cache[key] = (client, uid)
+            self._client_fd_to_server_addr[client.fileno()] = (r_addr, af)
 
             self._sockets.add(client.fileno())
             self._eventloop.add(client, eventloop.POLL_IN, self)
 
             logging.debug('UDP port %5d sockets %d' % (self._listen_port, len(self._sockets)))
 
-            logging.info('UDP data to %s:%d from %s:%d' %
+            common.connect_log('UDP data to %s:%d via port %d' %
                         (common.to_str(server_addr), server_port,
-                            r_addr[0], r_addr[1]))
+                            self._listen_port))
+        else:
+            client, client_uid = client_pair
+        self._cache.clear(self._udp_cache_size)
+        self._cache_dns_client.clear(16)
 
         if self._is_local:
-            data = encrypt.encrypt_all(self._password, self._method, 1, data)
+            ref_iv = [encrypt.encrypt_new_iv(self._method)]
+            self._protocol.obfs.server_info.iv = ref_iv[0]
+            data = self._protocol.client_udp_pre_encrypt(data)
+            #logging.debug("%s" % (binascii.hexlify(data),))
+            data = encrypt.encrypt_all_iv(self._protocol.obfs.server_info.key, self._method, 1, data, ref_iv)
             if not data:
                 return
         else:
@@ -1133,12 +1251,78 @@ class UDPRelay(object):
         try:
             #logging.info('UDP handle_server sendto %s:%d %d bytes' % (common.to_str(server_addr), server_port, len(data)))
             client.sendto(data, (server_addr, server_port))
+            self.add_transfer_u(client_uid, len(data))
         except IOError as e:
             err = eventloop.errno_from_exception(e)
             if err in (errno.EINPROGRESS, errno.EAGAIN):
                 pass
             else:
                 shell.print_exception(e)
+
+    def _handle_tcp_over_udp(self, data, r_addr):
+        #(cmd, request_id, data)
+        #logging.info("UDP data %d %d %s" % (data[0], data[1], binascii.hexlify(data[2])))
+        try:
+            self.server_transfer_ul += len(data[2])
+            if data[0] == 0:
+                if len(data[2]) >= 4:
+                    for i in range(64):
+                        req_id = random.randint(1, 65535)
+                        if req_id not in self._reqid_to_hd:
+                            break
+                    if req_id in self._reqid_to_hd:
+                        for i in range(64):
+                            req_id = random.randint(1, 65535)
+                            if type(self._reqid_to_hd[req_id]) is tuple:
+                                break
+                    # return req id
+                    self._reqid_to_hd[req_id] = (data[2][0:4], None)
+                    rsp_data = self._pack_rsp_data(CMD_RSP_CONNECT, req_id, RSP_STATE_CONNECTED)
+                    data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
+                    self.write_to_server_socket(data_to_send, r_addr)
+            elif data[0] == CMD_CONNECT_REMOTE:
+                if len(data[2]) > 4 and data[1] in self._reqid_to_hd:
+                    # create
+                    if type(self._reqid_to_hd[data[1]]) is tuple:
+                        if data[2][0:4] == self._reqid_to_hd[data[1]][0]:
+                            handle = TCPRelayHandler(self, self._reqid_to_hd, self._fd_to_handlers,
+                                self._eventloop, self._server_socket,
+                                self._reqid_to_hd[data[1]][0], self._reqid_to_hd[data[1]][1],
+                                self._config, self._dns_resolver, self._is_local)
+                            self._reqid_to_hd[data[1]] = handle
+                            handle.handle_client(r_addr, CMD_CONNECT, data[1], data[2])
+                            handle.handle_client(r_addr, *data)
+                            self.update_activity(handle)
+                        else:
+                            # disconnect
+                            rsp_data = self._pack_rsp_data(CMD_DISCONNECT, data[1], RSP_STATE_EMPTY)
+                            data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
+                            self.write_to_server_socket(data_to_send, r_addr)
+                    else:
+                        self.update_activity(self._reqid_to_hd[data[1]])
+                        self._reqid_to_hd[data[1]].handle_client(r_addr, *data)
+                else:
+                    # disconnect
+                    rsp_data = self._pack_rsp_data(CMD_DISCONNECT, data[1], RSP_STATE_EMPTY)
+                    data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
+                    self.write_to_server_socket(data_to_send, r_addr)
+            elif data[0] > CMD_CONNECT_REMOTE and data[0] <= CMD_DISCONNECT:
+                if data[1] in self._reqid_to_hd:
+                    if type(self._reqid_to_hd[data[1]]) is tuple:
+                        pass
+                    else:
+                        self.update_activity(self._reqid_to_hd[data[1]])
+                        self._reqid_to_hd[data[1]].handle_client(r_addr, *data)
+                else:
+                    # disconnect
+                    rsp_data = self._pack_rsp_data(CMD_DISCONNECT, data[1], RSP_STATE_EMPTY)
+                    data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
+                    self.write_to_server_socket(data_to_send, r_addr)
+            return
+        except Exception as e:
+            trace = traceback.format_exc()
+            logging.error(trace)
+            return
 
     def _handle_client(self, sock):
         data, r_addr = sock.recvfrom(BUF_SIZE)
@@ -1153,15 +1337,21 @@ class UDPRelay(object):
                 # drop
                 return
             data = pack_addr(r_addr[0]) + struct.pack('>H', r_addr[1]) + data
-            response = encrypt.encrypt_all(self._password, self._method, 1,
-                                           data)
+            ref_iv = [encrypt.encrypt_new_iv(self._method)]
+            self._protocol.obfs.server_info.iv = ref_iv[0]
+            data = self._protocol.server_udp_pre_encrypt(data)
+            response = encrypt.encrypt_all_iv(self._protocol.obfs.server_info.key, self._method, 1,
+                                           data, ref_iv)
             if not response:
                 return
         else:
-            data = encrypt.encrypt_all(self._password, self._method, 0,
-                                       data)
+            ref_iv = [0]
+            data = encrypt.encrypt_all_iv(self._protocol.obfs.server_info.key, self._method, 0,
+                                       data, ref_iv)
             if not data:
                 return
+            self._protocol.obfs.server_info.recv_iv = ref_iv[0]
+            data = self._protocol.client_udp_post_decrypt(data)
             header_result = parse_header(data)
             if header_result is None:
                 return
@@ -1171,22 +1361,31 @@ class UDPRelay(object):
             response = b'\x00\x00\x00' + data
         client_addr = self._client_fd_to_server_addr.get(sock.fileno())
         if client_addr:
-            self.write_to_server_socket(response, client_addr)
+            key = client_key(client_addr[0], client_addr[1])
+            client_pair = self._cache.get(key, None)
+            client_dns_pair = self._cache_dns_client.get(key, None)
+            if client_pair:
+                client, client_uid = client_pair
+                self.add_transfer_d(client_uid, len(response))
+            elif client_dns_pair:
+                client, client_uid = client_dns_pair
+                self.add_transfer_d(client_uid, len(response))
+            else:
+                self.server_transfer_dl += len(response)
+            self.write_to_server_socket(response, client_addr[0])
+            if client_dns_pair:
+                logging.debug("remove dns client %s:%d" % (client_addr[0][0], client_addr[0][1]))
+                del self._cache_dns_client[key]
+                self._close_client(client_dns_pair[0])
         else:
             # this packet is from somewhere else we know
             # simply drop that packet
             pass
 
     def write_to_server_socket(self, data, addr):
-        #self._server_socket.sendto(data, addr)
-        #'''
         uncomplete = False
         retry = 0
         try:
-            #"""
-            #if self._data_to_write_to_server_socket:
-            #    self._data_to_write_to_server_socket.append([(data, addr), 0])
-            #else:
             self._server_socket.sendto(data, addr)
             data = None
             while self._data_to_write_to_server_socket:
@@ -1195,7 +1394,6 @@ class UDPRelay(object):
                 del self._data_to_write_to_server_socket[0]
                 data, addr = data_buf[0]
                 self._server_socket.sendto(data, addr)
-            #"""
         except (OSError, IOError) as e:
             error_no = eventloop.errno_from_exception(e)
             uncomplete = True
@@ -1220,62 +1418,24 @@ class UDPRelay(object):
                             eventloop.POLL_IN | eventloop.POLL_ERR, self)
         loop.add_periodic(self.handle_periodic)
 
-    def remove_handler(self, handler):
-        index = self._handler_to_timeouts.get(hash(handler), -1)
-        if index >= 0:
-            # delete is O(n), so we just set it to None
-            self._timeouts[index] = None
-            del self._handler_to_timeouts[hash(handler)]
+    def remove_handler(self, client):
+        if hash(client) in self._timeout_cache:
+            del self._timeout_cache[hash(client)]
 
-    def update_activity(self, handler):
-        # set handler to active
-        now = int(time.time())
-        if now - handler.last_activity < eventloop.TIMEOUT_PRECISION:
-            # thus we can lower timeout modification frequency
-            return
-        handler.last_activity = now
-        index = self._handler_to_timeouts.get(hash(handler), -1)
-        if index >= 0:
-            # delete is O(n), so we just set it to None
-            self._timeouts[index] = None
-        length = len(self._timeouts)
-        self._timeouts.append(handler)
-        self._handler_to_timeouts[hash(handler)] = length
+    def update_activity(self, client):
+        self._timeout_cache[hash(client)] = client
 
     def _sweep_timeout(self):
-        # tornado's timeout memory management is more flexible than we need
-        # we just need a sorted last_activity queue and it's faster than heapq
-        # in fact we can do O(1) insertion/remove so we invent our own
-        if self._timeouts:
-            logging.log(shell.VERBOSE_LEVEL, 'sweeping timeouts')
-            now = time.time()
-            length = len(self._timeouts)
-            pos = self._timeout_offset
-            while pos < length:
-                handler = self._timeouts[pos]
-                if handler:
-                    if now - handler.last_activity < self._timeout:
-                        break
-                    else:
-                        if handler.remote_address:
-                            logging.warn('timed out: %s:%d' %
-                                         handler.remote_address)
-                        else:
-                            logging.warn('timed out')
-                        handler.destroy()
-                        handler.destroy_local()
-                        self._timeouts[pos] = None  # free memory
-                        pos += 1
-                else:
-                    pos += 1
-            if pos > TIMEOUTS_CLEAN_SIZE and pos > length >> 1:
-                # clean up the timeout queue when it gets larger than half
-                # of the queue
-                self._timeouts = self._timeouts[pos:]
-                for key in self._handler_to_timeouts:
-                    self._handler_to_timeouts[key] -= pos
-                pos = 0
-            self._timeout_offset = pos
+        self._timeout_cache.sweep()
+
+    def _close_tcp_client(self, client):
+        if client.remote_address:
+            logging.debug('timed out: %s:%d' %
+                         client.remote_address)
+        else:
+            logging.debug('timed out')
+        client.destroy()
+        client.destroy_local()
 
     def handle_event(self, sock, fd, event):
         if sock == self._server_socket:
@@ -1306,19 +1466,24 @@ class UDPRelay(object):
 
     def handle_periodic(self):
         if self._closed:
+            self._cache.clear(0)
+            self._cache_dns_client.clear(0)
+            self._dns_cache.sweep()
+            if self._eventloop:
+                self._eventloop.remove_periodic(self.handle_periodic)
+                self._eventloop.remove(self._server_socket)
             if self._server_socket:
                 self._server_socket.close()
                 self._server_socket = None
-                for sock in self._sockets:
-                    sock.close()
                 logging.info('closed UDP port %d', self._listen_port)
-        before_sweep_size = len(self._sockets)
-        self._cache.sweep()
-        self._dns_cache.sweep()
-        if before_sweep_size != len(self._sockets):
-            logging.debug('UDP port %5d sockets %d' % (self._listen_port, len(self._sockets)))
-        self._client_fd_to_server_addr.sweep()
-        self._sweep_timeout()
+        else:
+            before_sweep_size = len(self._sockets)
+            self._cache.sweep()
+            self._cache_dns_client.sweep()
+            self._dns_cache.sweep()
+            if before_sweep_size != len(self._sockets):
+                logging.debug('UDP port %5d sockets %d' % (self._listen_port, len(self._sockets)))
+            self._sweep_timeout()
 
     def close(self, next_tick=False):
         logging.debug('UDP close')
@@ -1328,5 +1493,5 @@ class UDPRelay(object):
                 self._eventloop.remove_periodic(self.handle_periodic)
                 self._eventloop.remove(self._server_socket)
             self._server_socket.close()
-            for client in list(self._cache.values()):
-                client.close()
+            self._cache.clear(0)
+            self._cache_dns_client.clear(0)

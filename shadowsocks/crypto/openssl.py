@@ -49,8 +49,15 @@ def load_openssl():
     libcrypto.EVP_CipherUpdate.argtypes = (c_void_p, c_void_p, c_void_p,
                                            c_char_p, c_int)
 
-    libcrypto.EVP_CIPHER_CTX_cleanup.argtypes = (c_void_p,)
+    if hasattr(libcrypto, "EVP_CIPHER_CTX_cleanup"):
+        libcrypto.EVP_CIPHER_CTX_cleanup.argtypes = (c_void_p,)
+    else:
+        libcrypto.EVP_CIPHER_CTX_reset.argtypes = (c_void_p,)
     libcrypto.EVP_CIPHER_CTX_free.argtypes = (c_void_p,)
+
+    libcrypto.RAND_bytes.restype = c_int
+    libcrypto.RAND_bytes.argtypes = (c_void_p, c_int)
+
     if hasattr(libcrypto, 'OpenSSL_add_all_ciphers'):
         libcrypto.OpenSSL_add_all_ciphers()
 
@@ -68,6 +75,14 @@ def load_cipher(cipher_name):
         return cipher()
     return None
 
+def rand_bytes(length):
+    if not loaded:
+        load_openssl()
+    buf = create_string_buffer(length)
+    r = libcrypto.RAND_bytes(buf, length)
+    if r <= 0:
+        raise Exception('RAND_bytes return error')
+    return buf.raw
 
 class OpenSSLCrypto(object):
     def __init__(self, cipher_name, key, iv, op):
@@ -108,11 +123,17 @@ class OpenSSLCrypto(object):
 
     def clean(self):
         if self._ctx:
-            libcrypto.EVP_CIPHER_CTX_cleanup(self._ctx)
+            if hasattr(libcrypto, "EVP_CIPHER_CTX_cleanup"):
+                libcrypto.EVP_CIPHER_CTX_cleanup(self._ctx)
+            else:
+                libcrypto.EVP_CIPHER_CTX_reset(self._ctx)
             libcrypto.EVP_CIPHER_CTX_free(self._ctx)
 
 
 ciphers = {
+    'aes-128-cbc': (16, 16, OpenSSLCrypto),
+    'aes-192-cbc': (24, 16, OpenSSLCrypto),
+    'aes-256-cbc': (32, 16, OpenSSLCrypto),
     'aes-128-cfb': (16, 16, OpenSSLCrypto),
     'aes-192-cfb': (24, 16, OpenSSLCrypto),
     'aes-256-cfb': (32, 16, OpenSSLCrypto),

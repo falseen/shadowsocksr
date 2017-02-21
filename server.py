@@ -27,27 +27,39 @@ if __name__ == '__main__':
 import server_pool
 import db_transfer
 from shadowsocks import shell
-
-#def test():
-#	 thread.start_new_thread(DbTransfer.thread_db, ())
-#	 Api.web_server()
+from configloader import load_config, get_config
 
 class MainThread(threading.Thread):
-	def __init__(self):
-		threading.Thread.__init__(self)
+	def __init__(self, obj):
+		super(MainThread, self).__init__()
+		self.daemon = True
+		self.obj = obj
 
 	def run(self):
-		db_transfer.DbTransfer.thread_db()
+		self.obj.thread_db(self.obj)
+
+	def stop(self):
+		self.obj.thread_db_stop()
 
 def main():
 	shell.check_python()
-	if True:
+	if False:
 		db_transfer.DbTransfer.thread_db()
 	else:
-		thread = MainThread()
+		if get_config().API_INTERFACE == 'mudbjson':
+			thread = MainThread(db_transfer.MuJsonTransfer)
+		elif get_config().API_INTERFACE == 'sspanelv2':
+			thread = MainThread(db_transfer.DbTransfer)
+		else:
+			thread = MainThread(db_transfer.Dbv3Transfer)
 		thread.start()
-		while True:
-			time.sleep(99999)
+		try:
+			while thread.is_alive():
+				time.sleep(10)
+		except (KeyboardInterrupt, IOError, OSError) as e:
+			import traceback
+			traceback.print_exc()
+			thread.stop()
 
 if __name__ == '__main__':
 	main()
