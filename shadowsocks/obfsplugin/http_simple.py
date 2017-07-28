@@ -159,7 +159,7 @@ class http_simple(plain.plain):
         if lines and len(lines) > 1:
             for line in lines:
                 if match_begin(line, b"Host: "):
-                    return line[6:]
+                    return common.to_str(line[6:])
 
     def not_match_return(self, buf):
         self.has_sent_header = True
@@ -219,7 +219,7 @@ class http_post(http_simple):
         super(http_post, self).__init__(method)
 
     def boundary(self):
-        return b''.join([random.choice(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") for i in range(32)])
+        return to_bytes(''.join([random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") for i in range(32)]))
 
     def client_encode(self, buf):
         if self.has_sent_header:
@@ -250,7 +250,7 @@ class http_post(http_simple):
             http_head += b"User-Agent: " + random.choice(self.user_agent) + b"\r\n"
             http_head += b"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.8\r\nAccept-Encoding: gzip, deflate\r\n"
             http_head += b"Content-Type: multipart/form-data; boundary=" + self.boundary() + b"\r\nDNT: 1\r\n"
-            http_head += "Connection: keep-alive\r\n\r\n"
+            http_head += b"Connection: keep-alive\r\n\r\n"
         self.has_sent_header = True
         return http_head + buf
 

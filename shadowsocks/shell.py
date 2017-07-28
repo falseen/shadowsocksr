@@ -111,12 +111,6 @@ def check_config(config, is_local):
     if config.get('server', '') in ['127.0.0.1', 'localhost']:
         logging.warning('warning: server set to listen on %s:%s, are you sure?' %
                      (to_str(config['server']), config['server_port']))
-    if (config.get('method', '') or '').lower() == 'table':
-        logging.warning('warning: table is not safe; please use a safer cipher, '
-                     'like AES-256-CFB')
-    if (config.get('method', '') or '').lower() == 'rc4':
-        logging.warning('warning: RC4 is not safe; please use a safer cipher, '
-                     'like AES-256-CFB')
     if config.get('timeout', 300) < 100:
         logging.warning('warning: your timeout %d seems too short' %
                      int(config.get('timeout')))
@@ -245,13 +239,14 @@ def get_config(is_local):
     config['obfs_param'] = to_str(config.get('obfs_param', ''))
     config['port_password'] = config.get('port_password', None)
     config['additional_ports'] = config.get('additional_ports', {})
+    config['additional_ports_only'] = config.get('additional_ports_only', False)
     config['timeout'] = int(config.get('timeout', 300))
     config['udp_timeout'] = int(config.get('udp_timeout', 120))
     config['udp_cache'] = int(config.get('udp_cache', 64))
     config['fast_open'] = config.get('fast_open', False)
     config['workers'] = config.get('workers', 1)
-    config['pid-file'] = config.get('pid-file', '/var/run/shadowsocks.pid')
-    config['log-file'] = config.get('log-file', '/var/log/shadowsocks.log')
+    config['pid-file'] = config.get('pid-file', '/var/run/shadowsocksr.pid')
+    config['log-file'] = config.get('log-file', '/var/log/shadowsocksr.log')
     config['verbose'] = config.get('verbose', False)
     config['connect_verbose_info'] = config.get('connect_verbose_info', 0)
     config['local_address'] = to_str(config.get('local_address', '127.0.0.1'))
@@ -278,7 +273,7 @@ def get_config(is_local):
             sys.exit(2)
         try:
             config['ignore_bind'] = \
-                IPNetwork(config.get('ignore_bind', '127.0.0.0/8,::1/128'))
+                IPNetwork(config.get('ignore_bind', '127.0.0.0/8,::1/128,10.0.0.0/8,192.168.0.0/16'))
         except Exception as e:
             logging.error(e)
             sys.exit(2)
