@@ -215,6 +215,9 @@ class UDPRelay(object):
         server_socket.setblocking(False)
         self._server_socket = server_socket
         self._stat_callback = stat_callback
+        self.last_log_time = 0
+        self.log_list = []
+        self.log_print_time = 5
 
     def _get_a_server(self):
         server = self._config['server']
@@ -468,10 +471,14 @@ class UDPRelay(object):
         try:
             client.sendto(data, (server_addr, server_port))
             self.add_transfer_u(client_uid, len(data))
-            if client_pair is None: # new request
-                addr, port = client.getsockname()[:2]
-                common.connect_log('UDP data to %s(%s):%d from %s:%d by user %d' %
-                        (common.to_str(remote_addr[0]), common.to_str(server_addr), server_port, addr, port, user_id))
+            #if client_pair is None: # new request
+            self.log_list.append('UDP data to %s:%d from %s:%d' %
+                        (common.to_str(remote_addr[0]), server_port, r_addr[0], r_addr[1]))
+            if time.time() - self.last_log_time > self.log_print_time:
+                self.last_log_time = time.time()
+                for x in set(self.log_list):
+                    common.connect_log("%s [%s count]" %(x, self.log_list.count(x)))
+                self.log_list = []
         except IOError as e:
             err = eventloop.errno_from_exception(e)
             logging.warning('IOError sendto %s:%d by user %d' % (server_addr, server_port, user_id))
